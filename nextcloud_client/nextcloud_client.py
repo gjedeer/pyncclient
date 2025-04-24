@@ -22,6 +22,21 @@ class ResponseError(Exception):
     def __init__(self, res, errorType):
         if type(res) is int:
             code = res
+        elif type(res) is str:
+            if "error:" in res:
+                # Try to extract code if format is like "HTTP error: 423"
+                try:
+                    code_part = res.split("error:")[1].strip()
+                    if code_part and code_part.isdigit():
+                        code = int(code_part)
+                    else:
+                        code = 499
+                except IndexError:
+                    code = 499
+            elif res.isdigit():
+                code = int(res)
+            else:
+                code = 499
         else:
             code = res.status_code
             self.res = res
