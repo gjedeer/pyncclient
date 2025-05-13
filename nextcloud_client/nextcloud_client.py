@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 import os
 import math
 import six
+import uuid
 from six.moves.urllib import parse
 
 
@@ -359,6 +360,7 @@ class Client(object):
 
         self._capabilities = None
         self._version = None
+        self._user_id = None
 
     def login(self, user_id, password):
         """Authenticate to nextCloud.
@@ -372,6 +374,7 @@ class Client(object):
         self._session = requests.session()
         self._session.verify = self._verify_certs
         self._session.auth = (user_id, password)
+        self._user_id = user_id
 
         try:
             self._update_capabilities()
@@ -387,6 +390,7 @@ class Client(object):
         except HTTPResponseError as e:
             self._session.close()
             self._session = None
+            self._user_id = None
             raise e
 
     def logout(self):
@@ -397,12 +401,14 @@ class Client(object):
         """
         # TODO actual logout ?
         self._session.close()
+        self._user_id = None
         return True
 
     def anon_login(self, folder_token, folder_password=''):
         self._session = requests.session()
         self._session.verify = self._verify_certs
         self._session.auth = (folder_token, folder_password)
+        self._user_id = None
 
         url_components = parse.urlparse(self.url)
         self._davpath = url_components.path + 'public.php/webdav'
@@ -645,6 +651,9 @@ class Client(object):
         """Uploads a file using chunks. If the file is smaller than
         ``chunk_size`` it will be uploaded directly.
 
+        This implements the chunked upload v2 API which supports uploads
+        directly to supporting target storages like S3.
+
         :param remote_path: path to the target file. A target directory can
         also be specified instead by appending a "/"
         :param local_source_file: path to the local file to upload
@@ -652,9 +661,10 @@ class Client(object):
         :returns: True if the operation succeeded, False otherwise
         :raises: HTTPResponseError in case an HTTP error status was returned
         """
+        # Set minimum chunk size to 5 MB as required by the API
         chunk_size = kwargs.get('chunk_size', 10 * 1024 * 1024)
-        result = True
-        transfer_id = int(time.time())
+        if chunk_size < 5 * 1024 * 1024:
+            chunk_size = 5 * 1024 * 1024
 
         remote_path = self._normalize_path(remote_path)
         if remote_path.endswith('/'):
@@ -667,43 +677,108 @@ class Client(object):
         size = file_handle.tell()
         file_handle.seek(0)
 
-        headers = {}
-        if kwargs.get('keep_mtime', True):
-            headers['X-OC-MTIME'] = str(int(stat_result.st_mtime))
-
-        if size == 0:
-            return self._make_dav_request(
+        # For empty files or files smaller than chunk_size, upload directly
+        if size == 0 or size <= chunk_size:
+            headers = {}
+            if kwargs.get('keep_mtime', True):
+                headers['X-OC-MTIME'] = str(int(stat_result.st_mtime))
+                
+            result = self._make_dav_request(
                 'PUT',
                 remote_path,
-                data='',
+                data='' if size == 0 else file_handle,
                 headers=headers
             )
+            file_handle.close()
+            return result
 
-        chunk_count = int(math.ceil(float(size) / float(chunk_size)))
+        # For larger files, use chunked upload v2
+        try:
+            # Check if user_id is available
+            if not self._user_id:
+                raise ValueError("User ID is required for chunked uploads")
 
-        if chunk_count > 1:
-            headers['OC-CHUNKED'] = '1'
-
-        for chunk_index in range(0, int(chunk_count)):
-            data = file_handle.read(chunk_size)
-            if chunk_count > 1:
-                chunk_name = '%s-chunking-%s-%i-%i' % \
-                             (remote_path, transfer_id, chunk_count,
-                              chunk_index)
-            else:
-                chunk_name = remote_path
-
-            if not self._make_dav_request(
+            # Generate a unique upload ID with prefix
+            transfer_id = f"pyncclient-upload-{uuid.uuid4()}"
+            
+            # Path for upload directory
+            upload_dir = f"remote.php/dav/uploads/{self._user_id}/{transfer_id}"
+            
+            # Destination URL for headers (target file path)
+            destination_url = f"{self.url}remote.php/dav/files/{self._user_id}{remote_path}"
+            
+            # Create the chunks directory
+            res = self._session.request(
+                'MKCOL',
+                f"{self.url}{upload_dir}",
+                headers={'Destination': destination_url}
+            )
+            
+            if res.status_code not in [201, 405]:  # 405 can happen if dir already exists
+                raise HTTPResponseError(res)
+                
+            # Calculate chunk count
+            chunk_count = int(math.ceil(float(size) / float(chunk_size)))
+            
+            # Upload each chunk
+            for chunk_index in range(1, chunk_count + 1):
+                data = file_handle.read(chunk_size)
+                chunk_name = f"{upload_dir}/{chunk_index:05d}"  # Format: 00001, 00002, etc.
+                
+                headers = {
+                    'Destination': destination_url,
+                    'OC-Total-Length': str(size)
+                }
+                
+                res = self._session.request(
                     'PUT',
-                    chunk_name,
+                    f"{self.url}{chunk_name}",
                     data=data,
                     headers=headers
-            ):
-                result = False
-                break
-
-        file_handle.close()
-        return result
+                )
+                
+                if res.status_code not in [201, 204]:
+                    # Try to clean up on error
+                    self._session.request('DELETE', f"{self.url}{upload_dir}")
+                    raise HTTPResponseError(res)
+            
+            # Assemble the chunks with MOVE
+            headers = {
+                'Destination': destination_url,
+                'OC-Total-Length': str(size)
+            }
+            
+            if kwargs.get('keep_mtime', True):
+                headers['X-OC-Mtime'] = str(int(stat_result.st_mtime))
+                
+            res = self._session.request(
+                'MOVE',
+                f"{self.url}{upload_dir}/.file",
+                headers=headers
+            )
+            
+            if res.status_code not in [201, 204]:
+                # Try to clean up on error
+                self._session.request('DELETE', f"{self.url}{upload_dir}")
+                raise HTTPResponseError(res)
+                
+            return True
+            
+        except Exception as e:
+            # Try to clean up the temporary directory
+            try:
+                if 'upload_dir' in locals():
+                    self._session.request('DELETE', f"{self.url}{upload_dir}")
+            except:
+                pass
+                
+            if isinstance(e, HTTPResponseError):
+                raise e
+            elif isinstance(e, ValueError):
+                raise e
+            return False
+        finally:
+            file_handle.close()
 
     def mkdir(self, path):
         """Creates a remote directory
